@@ -7,7 +7,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@opentelemetry/auto-instrumentations-node": "^0.82.0",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   }
