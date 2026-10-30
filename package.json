@@ -1,0 +1,13 @@
+{
+  "name": "obs-testing",
+  "version": "1.0.0",
+  "description": "Sample API for DevOpsArk Observability testing",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
