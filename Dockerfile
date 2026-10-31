@@ -7,13 +7,329 @@ WORKDIR /app
 RUN npm install -g @opentelemetry/auto-instrumentations-node
 ENV NODE_PATH="/usr/local/lib/node_modules"
 
-# 2. Copy user package manifests and install pure user dependencies
+# 2. DevOpsArk Industrial Platform Layer: Zero-touch console logger (lives in container, not customer repo)
+RUN mkdir -p /opt/devopsark && cat << 'HOOK_EOF' > /opt/devopsark/console-hook.cjs
+/**
+ * DevOpsArk Industrial-Grade Zero-Touch Console Logger (.cjs)
+ * Production-ready runtime telemetry hook:
+ * - Persistent HTTP/HTTPS connection pooling with keep-alive
+ * - Bounded ring buffer with drop policy to eliminate memory leaks / OOM
+ * - Batch splitting to prevent payload-too-large errors
+ * - In-flight concurrency limits to prevent network socket exhaustion
+ * - Exponential backoff with jitter on downstream errors
+ * - Safe formatting with circular reference and payload length guards
+ * - OpenTelemetry trace-log correlation via active span context
+ * - Graceful exit handlers (beforeExit)
+ */
+
+'use strict';
+
+const http = require('http');
+const https = require('https');
+const util = require('util');
+
+// Pass-through if explicitly disabled
+if (process.env.DEVOPSARK_LOG_DISABLED === 'true') {
+  return;
+}
+
+const endpoint = (process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://localhost:4000/v1/observability').replace(/\/+$/, '');
+const rawHeaders = process.env.OTEL_EXPORTER_OTLP_HEADERS || '';
+const serviceName = process.env.OTEL_SERVICE_NAME || 'node-app';
+
+const MAX_BUFFER_RECORDS = Math.max(100, parseInt(process.env.DEVOPSARK_LOG_BUFFER_SIZE, 10) || 5000);
+const BATCH_SIZE = Math.max(10, parseInt(process.env.DEVOPSARK_LOG_BATCH_SIZE, 10) || 200);
+const BASE_FLUSH_INTERVAL_MS = Math.max(200, parseInt(process.env.DEVOPSARK_LOG_FLUSH_INTERVAL_MS, 10) || 1000);
+const MAX_BACKOFF_MS = 30000;
+const MAX_MESSAGE_CHARS = Math.max(1024, parseInt(process.env.DEVOPSARK_LOG_MAX_MESSAGE_BYTES, 10) || 32768);
+const MAX_CONCURRENT_FLUSHES = 2;
+
+// Parse OTLP headers (x-api-key, x-organisation-id, x-project-id)
+const parsedHeaders = {
+  'Content-Type': 'application/json'
+};
+
+if (rawHeaders) {
+  rawHeaders.split(',').forEach(pair => {
+    const eqIdx = pair.indexOf('=');
+    if (eqIdx > 0) {
+      const k = pair.slice(0, eqIdx).trim();
+      const v = pair.slice(eqIdx + 1).trim();
+      if (k && v) parsedHeaders[k] = v;
+    }
+  });
+}
+
+// Persistent HTTP/HTTPS Connection Pooling
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  maxSockets: 5,
+  keepAliveMsecs: 30000,
+  timeout: 5000
+});
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 5,
+  keepAliveMsecs: 30000,
+  timeout: 5000
+});
+
+// State
+let logBuffer = [];
+let droppedRecordsCount = 0;
+let flushTimer = null;
+let activeFlushes = 0;
+let consecutiveFailures = 0;
+let isShuttingDown = false;
+
+// Cache OpenTelemetry API reference
+let otelApi = null;
+function getOtelApi() {
+  if (!otelApi) {
+    try {
+      otelApi = require('@opentelemetry/api');
+    } catch (_) {}
+  }
+  return otelApi;
+}
+
+function calculateBackoffDelay() {
+  if (consecutiveFailures === 0) return BASE_FLUSH_INTERVAL_MS;
+  // Exponential backoff: base * 2^failures + 30% jitter
+  const exp = Math.min(MAX_BACKOFF_MS, BASE_FLUSH_INTERVAL_MS * Math.pow(2, consecutiveFailures));
+  const jitter = Math.random() * 0.3 * exp;
+  return Math.min(MAX_BACKOFF_MS, Math.round(exp + jitter));
+}
+
+function scheduleNextFlush(delayMs) {
+  if (flushTimer || isShuttingDown) return;
+  const delay = typeof delayMs === 'number' ? delayMs : calculateBackoffDelay();
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    flushBatch();
+  }, delay);
+  if (flushTimer.unref) flushTimer.unref(); // Don't block Node process from exiting
+}
+
+function flushBatch() {
+  if (logBuffer.length === 0 || activeFlushes >= MAX_CONCURRENT_FLUSHES) return;
+
+  // Extract a batch up to BATCH_SIZE
+  const records = logBuffer.splice(0, BATCH_SIZE);
+
+  // If records were dropped due to buffer overflow, inject an alert log record
+  if (droppedRecordsCount > 0) {
+    const droppedCount = droppedRecordsCount;
+    droppedRecordsCount = 0;
+    records.unshift({
+      timeUnixNano: (Date.now() * 1e6).toString(),
+      severityText: 'WARN',
+      body: {
+        stringValue: `[DevOpsArk Hook] Buffer limit exceeded (${MAX_BUFFER_RECORDS}); dropped ${droppedCount} log records to protect application memory.`
+      },
+      traceId: null,
+      spanId: null
+    });
+  }
+
+  activeFlushes++;
+
+  try {
+    const url = new URL(endpoint + '/v1/logs');
+    const isHttps = url.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
+
+    const payload = JSON.stringify({
+      resourceLogs: [{
+        resource: {
+          attributes: [
+            { key: 'service.name', value: { stringValue: serviceName } }
+          ]
+        },
+        scopeLogs: [{
+          logRecords: records
+        }]
+      }]
+    });
+
+    const req = client.request(url, {
+      method: 'POST',
+      agent,
+      headers: {
+        ...parsedHeaders,
+        'Content-Length': Buffer.byteLength(payload)
+      },
+      timeout: 5000
+    });
+
+    let completed = false;
+    const onDone = (success) => {
+      if (completed) return;
+      completed = true;
+      activeFlushes--;
+
+      if (success) {
+        consecutiveFailures = 0;
+      } else {
+        consecutiveFailures++;
+      }
+
+      // If more logs accumulated, continue flushing
+      if (logBuffer.length > 0) {
+        if (logBuffer.length >= BATCH_SIZE && consecutiveFailures === 0 && activeFlushes < MAX_CONCURRENT_FLUSHES) {
+          // Drain high volume immediately without waiting for timer
+          setImmediate(flushBatch);
+        } else {
+          scheduleNextFlush();
+        }
+      }
+    };
+
+    req.on('response', (res) => {
+      // Consume response body to free socket for keep-alive pool
+      res.resume();
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        onDone(true);
+      } else {
+        onDone(false);
+      }
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      onDone(false);
+    });
+
+    req.on('error', () => {
+      onDone(false);
+    });
+
+    req.write(payload);
+    req.end();
+  } catch (_) {
+    activeFlushes--;
+    consecutiveFailures++;
+    scheduleNextFlush();
+  }
+}
+
+function safeFormatMessage(args) {
+  try {
+    let formatted;
+    if (util.formatWithOptions) {
+      formatted = util.formatWithOptions({ depth: 3, maxArrayLength: 50, breakLength: Infinity }, ...args);
+    } else {
+      formatted = util.format(...args);
+    }
+
+    if (formatted.length > MAX_MESSAGE_CHARS) {
+      return formatted.slice(0, MAX_MESSAGE_CHARS) + `... [truncated by DevOpsArk: exceeded ${MAX_MESSAGE_CHARS} chars]`;
+    }
+    return formatted;
+  } catch (err) {
+    return `[DevOpsArk Serialization Error: ${err && err.message ? err.message : 'Unknown'}]`;
+  }
+}
+
+function captureLog(level, args) {
+  const message = safeFormatMessage(args);
+  const timeUnixNano = (Date.now() * 1e6).toString();
+
+  // Correlate with active OpenTelemetry trace context
+  let traceId = null;
+  let spanId = null;
+  try {
+    const api = getOtelApi();
+    const span = api?.trace?.getActiveSpan();
+    if (span) {
+      const ctx = span.spanContext();
+      if (ctx && ctx.traceId) traceId = ctx.traceId;
+      if (ctx && ctx.spanId) spanId = ctx.spanId;
+    }
+  } catch (_) {}
+
+  // Bounded Ring Buffer check (OOM Protection)
+  if (logBuffer.length >= MAX_BUFFER_RECORDS) {
+    logBuffer.shift();
+    droppedRecordsCount++;
+  }
+
+  logBuffer.push({
+    timeUnixNano,
+    severityText: level,
+    body: { stringValue: message },
+    traceId,
+    spanId
+  });
+
+  // Fast flush trigger if buffer hits batch size and healthy
+  if (logBuffer.length >= BATCH_SIZE && consecutiveFailures === 0 && activeFlushes < MAX_CONCURRENT_FLUSHES) {
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    flushBatch();
+  } else {
+    scheduleNextFlush();
+  }
+}
+
+// Flush remaining logs before process termination
+function flushSyncOrFinal() {
+  isShuttingDown = true;
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  while (logBuffer.length > 0 && activeFlushes < 5) {
+    flushBatch();
+  }
+}
+
+process.on('beforeExit', () => {
+  flushSyncOrFinal();
+  try {
+    httpAgent.destroy();
+    httpsAgent.destroy();
+  } catch (_) {}
+});
+
+// Intercept console functions while preserving native terminal output
+const originalLog = console.log;
+const originalInfo = console.info;
+const originalWarn = console.warn;
+const originalError = console.error;
+
+console.log = function(...args) {
+  originalLog.apply(console, args);
+  captureLog('INFO', args);
+};
+
+console.info = function(...args) {
+  originalInfo.apply(console, args);
+  captureLog('INFO', args);
+};
+
+console.warn = function(...args) {
+  originalWarn.apply(console, args);
+  captureLog('WARN', args);
+};
+
+console.error = function(...args) {
+  originalError.apply(console, args);
+  captureLog('ERROR', args);
+};
+HOOK_EOF
+
+# 3. Copy user package manifests and install pure user dependencies
 COPY package*.json ./
 RUN npm install --production
 
-# 3. Copy application source
+# 4. Copy application source
 COPY . .
 
-EXPOSE 5001
+EXPOSE 5002
 
 CMD ["npm", "start"]
