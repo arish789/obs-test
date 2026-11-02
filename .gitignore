@@ -1,2 +1,4 @@
 node_modules/
 .env
+LEVEL_2_OBSERVABILITY_TEST_REPORT.md
+TESTING_GUIDE.md

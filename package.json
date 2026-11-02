@@ -1,10 +1,11 @@
 {
   "name": "obs-testing",
   "version": "1.0.0",
-  "description": "Sample API for DevOpsArk Observability testing",
+  "description": "Realistic customer-like API for DevOpsArk Observability testing",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test:workload": "node -e 'require(\"http\").get(\"http://127.0.0.1:\" + (process.env.PORT || 5002) + \"/api/workload/run\", (res) => res.pipe(process.stdout))'"
   },
   "dependencies": {
     "cors": "^2.8.5",
