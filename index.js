@@ -3,7 +3,7 @@ const cors = require('cors');
 const http = require('http');
 
 const app = express();
-const PORT = parseInt(process.env.PORT, 10) || 5002;
+const PORT = parseInt(process.env.PORT, 10) || 5000;
 const SERVICE_NAME = process.env.OTEL_SERVICE_NAME || 'obs-testing-service';
 
 app.use(cors());
