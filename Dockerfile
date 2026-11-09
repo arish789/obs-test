@@ -16,7 +16,7 @@ RUN npm install
 COPY . .
 
 # Expose the port the app listens on
-EXPOSE 5002
+EXPOSE 5000
 
 # Command to run the application
 
